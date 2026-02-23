@@ -52,6 +52,28 @@ docker exec -it openvla-dev-headless bash
 # Inside: cd /workspace/openvla-oft
 ```
 
+### X11 (GUI display for LIBERO, MuJoCo, etc.)
+
+On the host, allow Docker to access the X server:
+
+```bash
+xhost +local:docker
+```
+
+Then start the container:
+
+```bash
+docker compose -f docker/docker-compose.x11.yaml up -d
+docker exec -it openvla-dev-gui bash
+# Inside: cd /workspace/openvla-oft
+```
+
+For LIBERO simulation, build with `INCLUDE_LIBERO=1`:
+
+```bash
+docker compose -f docker/docker-compose.x11.yaml build --build-arg INCLUDE_LIBERO=1
+```
+
 ### One-off
 
 ```bash

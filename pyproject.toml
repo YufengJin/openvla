@@ -58,6 +58,7 @@ dependencies = [
     "uvicorn",
     "fastapi",
     "json-numpy",
+    "policy-websocket @ git+https://github.com/YufengJin/policy_websocket.git",
 ]
 
 [project.optional-dependencies]

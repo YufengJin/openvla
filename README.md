@@ -73,6 +73,10 @@ for act in actions:
 
 See [SETUP.md](SETUP.md) for instructions on setting up the conda environment.
 
+## Model Architecture and Fine-Tuning
+
+See [docs/ARCHITECTURE_AND_FINETUNE.md](docs/ARCHITECTURE_AND_FINETUNE.md) for an explanation of Prismatic VLM weights, the OpenVLA model structure, and the LoRA/fine-tuning methodology.
+
 ## Training and Evaluation
 
 See [LIBERO.md](LIBERO.md) for fine-tuning/evaluating on LIBERO simulation benchmark task suites.

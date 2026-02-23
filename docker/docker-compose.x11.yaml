@@ -1,0 +1,55 @@
+# X11 mode: supports GUI display (LIBERO, MuJoCo, etc.).
+#
+# Pre-requisite on host:  xhost +local:docker
+#
+# Usage:
+#   docker compose -f docker/docker-compose.x11.yaml up --build
+#   docker exec -it openvla-dev-gui bash
+
+services:
+  openvla-dev-gui:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        INCLUDE_LIBERO: 0 
+        INCLUDE_FLASH_ATTN: 1
+    image: openvla-oft:latest
+    container_name: openvla-dev-gui
+    restart: unless-stopped
+
+    tty: true
+    stdin_open: true
+
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - PYTHONUNBUFFERED=1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+
+    volumes:
+      - ..:/workspace/openvla-oft
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ${HOME}/.Xauthority:/root/.Xauthority:rw
+
+    network_mode: host
+    ipc: host
+    pid: host
+
+    command: tail -f /dev/null
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, compute, utility]
+
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
+      nproc: 65536
+      memlock: -1
+      stack: 67108864

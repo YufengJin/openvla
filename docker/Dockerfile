@@ -15,17 +15,17 @@ ENV LC_ALL=C.UTF-8
 ENV LANG=C.UTF-8
 
 # -----------------------------------------------------------------------------
-# 1. System dependencies
+# 1. System dependencies + debug tools
 # -----------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y \
     curl wget tar procps bzip2 ca-certificates git build-essential cmake ninja-build unzip \
     ffmpeg libgl1-mesa-glx libglib2.0-0 \
+    lsof psmisc tmux vim x11-apps \
     && rm -rf /var/lib/apt/lists/*
 
 RUN if [ "${INCLUDE_LIBERO}" = "1" ]; then \
     apt-get update && apt-get install -y --no-install-recommends \
         libx11-6 libxext6 libxrender1 libsm6 libegl1 libosmesa6 \
-        lsof psmisc \
     && rm -rf /var/lib/apt/lists/*; fi
 
 # -----------------------------------------------------------------------------
@@ -54,25 +54,18 @@ RUN micromamba run -n ${ENV_NAME} pip install \
     --index-url https://download.pytorch.org/whl/cu118
 
 # -----------------------------------------------------------------------------
-# 5. openvla-oft (editable install at build time; entrypoint re-runs when mounted)
+# 5. Copy project (for LIBERO requirements; packaging/ninja/flash-attn in entrypoint)
 # -----------------------------------------------------------------------------
 WORKDIR /tmp/openvla-oft
 COPY . .
-RUN micromamba run -n ${ENV_NAME} pip install -e .
 
 # -----------------------------------------------------------------------------
-# 6. Flash Attention 2 (for training; optional)
-# -----------------------------------------------------------------------------
-RUN micromamba run -n ${ENV_NAME} pip install packaging ninja
-RUN if [ "${INCLUDE_FLASH_ATTN}" = "1" ]; then \
-    micromamba run -n ${ENV_NAME} pip install "flash-attn==2.5.5" --no-build-isolation; fi
-
-# -----------------------------------------------------------------------------
-# 7. LIBERO (optional; for simulation benchmark)
+# 7. LIBERO (optional; for simulation benchmark) TODO replace new libero repo
 # -----------------------------------------------------------------------------
 RUN if [ "${INCLUDE_LIBERO}" = "1" ]; then \
     mkdir -p /opt/third_party && cd /opt/third_party && \
     git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git && \
+    touch /opt/third_party/LIBERO/libero/__init__.py && \       
     micromamba run -n ${ENV_NAME} pip install -e /opt/third_party/LIBERO && \
     micromamba run -n ${ENV_NAME} pip install -r /tmp/openvla-oft/experiments/robot/libero/libero_requirements.txt; fi
 
