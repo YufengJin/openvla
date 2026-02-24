@@ -6,10 +6,7 @@
 
   "customizations": {
     "vscode": {
-      "extensions": [
-        "ms-python.python",
-        "ms-python.debugpy"
-      ],
+      "extensions": [],
       "settings": {
         "python.defaultInterpreterPath": "/opt/conda/envs/openvla_env/bin/python"
       }

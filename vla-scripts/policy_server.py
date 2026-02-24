@@ -1,34 +1,17 @@
 """
 policy_server.py — OpenVLA policy server over WebSocket.
 
-Serves OpenVLA-OFT as a WebSocket policy compatible with LIBERO and RoboCasa run_eval
-clients. Supports both one-step and action-chunk modes. All observation remapping and
-action post-processing conversions are centralized here.
+Serves OpenVLA-OFT as a WebSocket policy compatible with LIBERO and RoboCasa.
+Client sends raw robosuite obs; server handles all remapping (raw LIBERO, raw RoboCasa, or prepared).
+Output: action_dim 7 (cartesian_pose + gripper). Use --arm_controller cartesian_pose on client.
 
 Usage:
-    # Action chunk mode (predict 8, execute 8 — default for LIBERO checkpoint):
-    python vla-scripts/policy_server.py \\
-        --pretrained_checkpoint moojink/openvla-7b-oft-finetuned-libero-spatial \\
-        --obs_remap libero \\
-        --unnorm_key libero_spatial_no_noops \\
-        --port 8000
+    python vla-scripts/policy_server.py --port 8000
+    python vla-scripts/policy_server.py --execute_steps 1 --port 8000  # one-step mode
 
-    # One-step mode (re-query every step):
-    python vla-scripts/policy_server.py \\
-        --pretrained_checkpoint moojink/openvla-7b-oft-finetuned-libero-spatial \\
-        --obs_remap libero \\
-        --execute_steps 1 \\
-        --port 8000
-
-    # RoboCasa obs format:
-    python vla-scripts/policy_server.py \\
-        --pretrained_checkpoint moojink/openvla-7b-oft-finetuned-libero-spatial \\
-        --obs_remap robocasa \\
-        --port 8000
-
-Then connect with:
-    python LIBERO/scripts/run_eval.py --policy_server_addr localhost:8000
-    python robocasa/scripts/run_eval.py --policy_server_addr localhost:8000
+Client (use --arm_controller cartesian_pose):
+    python LIBERO/scripts/run_demo.py --policy_server_addr localhost:8000 --task_suite_name libero_10
+    python robocasa/scripts/run_demo.py --policy_server_addr localhost:8000 --task_name PnPCounterToCab
 """
 
 from __future__ import annotations
@@ -38,15 +21,14 @@ import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict
 
 import numpy as np
 
-# Ensure openvla-oft project root is on path (vla-scripts/ is inside project)
-_SCRIPT_DIR = Path(__file__).resolve().parent
-_PROJECT_ROOT = _SCRIPT_DIR.parent
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
+# Required for `from experiments.robot...` when run as python vla-scripts/policy_server.py
+_root = Path(__file__).resolve().parent.parent
+if str(_root) not in sys.path:
+    sys.path.insert(0, str(_root))
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +36,75 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Observation remapping: client format -> OpenVLA format
 # ---------------------------------------------------------------------------
+
+# Required keys for each format (for validation)
+RAW_LIBERO_KEYS = ("agentview_image", "robot0_eye_in_hand_image")
+RAW_ROBOCASA_KEYS = ("robot0_agentview_left_image", "robot0_eye_in_hand_image")
+PREPARED_KEYS = ("primary_image", "wrist_image")
+
+
+def _validate_keys(obs: Dict[str, Any], required: tuple, format_name: str) -> None:
+    """Raise ValueError if any required key is missing."""
+    missing = [k for k in required if k not in obs or obs[k] is None]
+    if missing:
+        raise ValueError(
+            f"Observation format '{format_name}' requires keys {list(required)}. "
+            f"Missing: {missing}. Received keys: {list(obs.keys())[:20]}..."
+        )
+
+
+def prepare_obs_from_libero(raw_obs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert raw LIBERO (robosuite) obs to OpenVLA format.
+    Raw keys: agentview_image, robot0_eye_in_hand_image, robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos.
+    """
+    _validate_keys(raw_obs, RAW_LIBERO_KEYS, "raw_libero")
+    primary = np.asarray(raw_obs["agentview_image"])
+    wrist = np.asarray(raw_obs["robot0_eye_in_hand_image"])
+    # LIBERO renders upside-down: flipud then fliplr for 180 deg to match training
+    primary = np.fliplr(np.flipud(primary))
+    wrist = np.fliplr(np.flipud(wrist))
+    out = {
+        "full_image": primary,
+        "wrist_image": wrist,
+        "task_description": raw_obs.get("task_description", ""),
+    }
+    if "robot0_eef_pos" in raw_obs and raw_obs["robot0_eef_pos"] is not None:
+        out["state"] = np.concatenate([
+            np.asarray(raw_obs["robot0_eef_pos"]),
+            _quat2axisangle(raw_obs["robot0_eef_quat"]),
+            np.asarray(raw_obs["robot0_gripper_qpos"]),
+        ]).astype(np.float64)
+    else:
+        out["state"] = np.zeros(8, dtype=np.float64)
+    return out
+
+
+def prepare_obs_from_robocasa(raw_obs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert raw RoboCasa (robosuite) obs to OpenVLA format.
+    Raw keys: robot0_agentview_left_image, robot0_eye_in_hand_image, robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos.
+    """
+    _validate_keys(raw_obs, RAW_ROBOCASA_KEYS, "raw_robocasa")
+    primary = np.asarray(raw_obs["robot0_agentview_left_image"])
+    wrist = np.asarray(raw_obs["robot0_eye_in_hand_image"])
+    primary = np.fliplr(np.flipud(primary))
+    wrist = np.fliplr(np.flipud(wrist))
+    out = {
+        "full_image": primary,
+        "wrist_image": wrist,
+        "task_description": raw_obs.get("task_description", ""),
+    }
+    if "robot0_eef_pos" in raw_obs and raw_obs["robot0_eef_pos"] is not None:
+        out["state"] = np.concatenate([
+            np.asarray(raw_obs["robot0_eef_pos"]),
+            _quat2axisangle(raw_obs["robot0_eef_quat"]),
+            np.asarray(raw_obs["robot0_gripper_qpos"]),
+        ]).astype(np.float64)
+    else:
+        out["state"] = np.zeros(8, dtype=np.float64)
+    return out
+
 
 def _quat2axisangle(quat: np.ndarray) -> np.ndarray:
     """Convert quaternion (x,y,z,w) to axis-angle. Same as libero_utils.quat2axisangle."""
@@ -68,14 +119,13 @@ def _quat2axisangle(quat: np.ndarray) -> np.ndarray:
     return (quat[:3] * 2.0 * math.acos(quat[3])) / den
 
 
-def remap_obs_libero(obs: Dict[str, Any]) -> Dict[str, Any]:
+def remap_obs_prepared(obs: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Remap LIBERO run_eval observation to OpenVLA format.
-
-    Client sends: primary_image (flipud), wrist_image (flipud), task_description.
-    OpenVLA training uses 180 deg rotation [::-1, ::-1]. Client uses flipud only,
-    so we apply fliplr to get 180 deg and match training.
+    Remap prepared observation (primary_image, wrist_image, state/proprio) to OpenVLA format.
+    Client sends: primary_image (flipud), wrist_image (flipud), task_description,
+    and optionally state or robot0_eef_pos/robot0_eef_quat/robot0_gripper_qpos or proprio.
     """
+    _validate_keys(obs, PREPARED_KEYS, "prepared")
     primary = np.asarray(obs["primary_image"])
     wrist = np.asarray(obs["wrist_image"])
     out = {
@@ -83,64 +133,49 @@ def remap_obs_libero(obs: Dict[str, Any]) -> Dict[str, Any]:
         "wrist_image": np.fliplr(wrist),
         "task_description": obs.get("task_description", ""),
     }
-    # LIBERO client typically does not send proprio; use zeros if missing
-    if "state" in obs:
+    # State: LIBERO sends state (8D) or robot0_*; RoboCasa sends proprio (9D: gripper+eef_pos+eef_quat)
+    if "state" in obs and obs["state"] is not None:
         out["state"] = np.asarray(obs["state"], dtype=np.float64)
-    elif "robot0_eef_pos" in obs:
-        eef_pos = obs["robot0_eef_pos"]
-        eef_quat = obs["robot0_eef_quat"]
-        gripper_qpos = obs["robot0_gripper_qpos"]
-        out["state"] = np.concatenate([
-            np.asarray(eef_pos),
-            _quat2axisangle(eef_quat),
-            np.asarray(gripper_qpos),
-        ]).astype(np.float64)
-    else:
-        out["state"] = np.zeros(8, dtype=np.float64)  # PROPRIO_DIM for LIBERO
-        logger.debug("LIBERO obs has no proprio; using zeros")
-    return out
-
-
-def remap_obs_robocasa(obs: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Remap RoboCasa run_eval observation to OpenVLA format.
-
-    Client sends: primary_image (flipud), secondary_image, wrist_image (flipud), proprio, task_description.
-    RoboCasa proprio = gripper_qpos (2) + eef_pos (3) + eef_quat (4) = 9.
-    OpenVLA LIBERO state = eef_pos (3) + axis_angle (3) + gripper_qpos (2) = 8.
-    Apply fliplr to match 180 deg rotation (client uses flipud).
-    """
-    primary = np.asarray(obs["primary_image"])
-    wrist = np.asarray(obs["wrist_image"])
-    out = {
-        "full_image": np.fliplr(primary),
-        "wrist_image": np.fliplr(wrist),
-        "task_description": obs.get("task_description", ""),
-    }
-    if "proprio" in obs:
+    elif "proprio" in obs and obs["proprio"] is not None:
         p = np.asarray(obs["proprio"]).flatten()
-        # proprio = [gripper(2), eef_pos(3), eef_quat(4)]
         if len(p) >= 9:
-            gripper = p[:2]
-            eef_pos = p[2:5]
-            eef_quat = p[5:9]
+            gripper, eef_pos, eef_quat = p[:2], p[2:5], p[5:9]
             axis_angle = _quat2axisangle(eef_quat)
             out["state"] = np.concatenate([eef_pos, axis_angle, gripper]).astype(np.float64)
         else:
             out["state"] = np.zeros(8, dtype=np.float64)
-            logger.debug("RoboCasa proprio dim < 9; using zeros")
-    elif "state" in obs:
-        out["state"] = np.asarray(obs["state"], dtype=np.float64)
+    elif "robot0_eef_pos" in obs and obs["robot0_eef_pos"] is not None:
+        out["state"] = np.concatenate([
+            np.asarray(obs["robot0_eef_pos"]),
+            _quat2axisangle(obs["robot0_eef_quat"]),
+            np.asarray(obs["robot0_gripper_qpos"]),
+        ]).astype(np.float64)
     else:
         out["state"] = np.zeros(8, dtype=np.float64)
-        logger.debug("RoboCasa obs has no proprio; using zeros")
     return out
 
 
-OBS_REMAP_FN = {
-    "libero": remap_obs_libero,
-    "robocasa": remap_obs_robocasa,
-}
+def remap_obs_to_openvla(obs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Detect obs format and remap to OpenVLA format (full_image, wrist_image, state, task_description).
+    Supports: raw LIBERO, raw RoboCasa, prepared (primary_image/wrist_image).
+    Raises ValueError if required keys are missing.
+    """
+    # Format A: raw LIBERO (agentview_image)
+    if "agentview_image" in obs and obs["agentview_image"] is not None:
+        return prepare_obs_from_libero(obs)
+    # Format B: raw RoboCasa (robot0_agentview_left_image)
+    if "robot0_agentview_left_image" in obs and obs["robot0_agentview_left_image"] is not None:
+        return prepare_obs_from_robocasa(obs)
+    # Format C: prepared (primary_image, wrist_image)
+    if "primary_image" in obs and obs["primary_image"] is not None:
+        return remap_obs_prepared(obs)
+    raise ValueError(
+        "Observation format not recognized. Expected one of: "
+        "raw LIBERO (agentview_image, robot0_eye_in_hand_image), "
+        "raw RoboCasa (robot0_agentview_left_image, robot0_eye_in_hand_image), "
+        f"prepared (primary_image, wrist_image). Received keys: {list(obs.keys())[:25]}..."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +218,6 @@ def postprocess_action_for_env(action: np.ndarray, invert_gripper: bool = True) 
 class PolicyServerConfig:
     pretrained_checkpoint: str = ""
     unnorm_key: str = "libero_spatial_no_noops"
-    obs_remap: str = "libero"  # libero | robocasa
     use_l1_regression: bool = True
     use_diffusion: bool = False
     use_film: bool = False
@@ -202,9 +236,6 @@ class OpenVLAPolicy:
 
     def __init__(self, cfg: PolicyServerConfig) -> None:
         self.cfg = cfg
-        self._remap_fn = OBS_REMAP_FN.get(cfg.obs_remap)
-        if self._remap_fn is None:
-            raise ValueError(f"Unknown obs_remap: {cfg.obs_remap}. Choose: libero, robocasa")
 
         # Lazy load heavy deps
         from experiments.robot.openvla_utils import (
@@ -243,10 +274,15 @@ class OpenVLAPolicy:
         self.resize_size = get_image_resize_size(c)
 
     def infer(self, obs: Dict[str, Any]) -> Dict[str, Any]:
-        if "action_dim" in obs and "primary_image" not in obs:
+        # Init: action_dim only, no images
+        has_images = any(
+            k in obs and obs.get(k) is not None
+            for k in ("primary_image", "agentview_image", "robot0_agentview_left_image")
+        )
+        if "action_dim" in obs and not has_images:
             return {"actions": np.zeros(int(obs["action_dim"]), dtype=np.float64)}
 
-        openvla_obs = self._remap_fn(obs)
+        openvla_obs = remap_obs_to_openvla(obs)
         from experiments.robot.openvla_utils import get_vla_action
 
         actions = get_vla_action(
@@ -279,7 +315,7 @@ def main():
     from policy_websocket import ActionChunkBroker, BasePolicy, WebsocketPolicyServer
 
     parser = argparse.ArgumentParser(
-        description="OpenVLA policy server (WebSocket, obs_remap libero/robocasa)",
+        description="OpenVLA policy server (WebSocket, auto-detects obs format)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--host", default="0.0.0.0")
@@ -295,13 +331,6 @@ def main():
         type=str,
         default="libero_spatial_no_noops",
         help="Dataset key for action un-normalization",
-    )
-    parser.add_argument(
-        "--obs_remap",
-        type=str,
-        choices=["libero", "robocasa"],
-        default="libero",
-        help="Observation format from client (LIBERO or RoboCasa run_eval)",
     )
     parser.add_argument(
         "--use_film",
@@ -337,7 +366,6 @@ def main():
     cfg = PolicyServerConfig(
         pretrained_checkpoint=args.pretrained_checkpoint,
         unnorm_key=args.unnorm_key,
-        obs_remap=args.obs_remap,
         use_film=args.use_film,
         num_images_in_input=args.num_images_in_input,
         use_proprio=not args.no_proprio,
@@ -356,7 +384,11 @@ def main():
                 self._p = p
 
             def infer(self, obs):
-                if "action_dim" in obs and "primary_image" not in obs:
+                has_images = any(
+                    k in obs and obs.get(k) is not None
+                    for k in ("primary_image", "agentview_image", "robot0_agentview_left_image")
+                )
+                if "action_dim" in obs and not has_images:
                     self._p.reset()
                 return self._p.infer(obs)
 
@@ -370,7 +402,6 @@ def main():
     metadata = {
         "policy_name": "OpenVLAPolicy",
         "action_dim": 7,
-        "obs_remap": cfg.obs_remap,
         "execute_steps": cfg.execute_steps,
         "checkpoint": cfg.pretrained_checkpoint,
     }
@@ -383,7 +414,7 @@ def main():
     )
     print(
         f"OpenVLA policy server on ws://{args.host}:{args.port} "
-        f"(obs_remap={cfg.obs_remap}, execute_steps={cfg.execute_steps})"
+        f"(execute_steps={cfg.execute_steps})"
     )
     print("Press Ctrl+C to stop.")
     try:

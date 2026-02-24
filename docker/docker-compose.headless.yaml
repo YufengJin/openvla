@@ -4,7 +4,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
       args:
-        INCLUDE_LIBERO: 0
+        INCLUDE_LIBERO: 1
         INCLUDE_FLASH_ATTN: 1
     image: openvla-oft:latest
     container_name: openvla-dev-headless
